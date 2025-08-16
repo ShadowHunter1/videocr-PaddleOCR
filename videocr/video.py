@@ -3,6 +3,7 @@ from typing import List
 import cv2
 import numpy as np
 import os
+import warnings
 
 from . import utils
 from .models import PredictedFrames, PredictedSubtitle
@@ -19,6 +20,7 @@ class Video:
     num_frames: int
     fps: float
     height: int
+    width: int
     ocr: PaddleOCR
     pred_frames: List[PredictedFrames]
     pred_subs: List[PredictedSubtitle]
@@ -31,6 +33,7 @@ class Video:
             self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
             self.fps = v.get(cv2.CAP_PROP_FPS)
             self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     def run_ocr(self, use_gpu: bool, lang: str, time_start: str, time_end: str,
                 conf_threshold: int, use_fullframe: bool, brightness_threshold: int, similar_image_threshold: int, similar_pixel_threshold: int, frames_to_skip: int,
@@ -68,11 +71,42 @@ class Video:
             raise ValueError('time_start is later than time_end')
         num_ocr_frames = ocr_end - ocr_start
 
+        crop_x_start = None
+        crop_y_start = None
         crop_x_end = None
         crop_y_end = None
-        if crop_x is not None and crop_y is not None and crop_width and crop_height:
-            crop_x_end = crop_x + crop_width
-            crop_y_end = crop_y + crop_height
+
+        if self.use_fullframe:
+            if any(p is not None for p in [crop_x, crop_y, crop_width, crop_height]):
+                warnings.warn("use_fullframe=True: Ignoring provided crop parameters.")
+        else:
+            if all(p is None for p in [crop_x, crop_y, crop_width, crop_height]):
+                warnings.warn(r"use_fullframe=False and no crop provided: defaulting to lower 30% region of the frame.")
+            else:
+                # infer missing crop parameters
+                inferred_x = 0 if crop_x is None else crop_x
+                inferred_y = 0 if crop_y is None else crop_y
+                inferred_width = (self.width - inferred_x) if crop_width is None else crop_width
+                inferred_height = (self.height - inferred_y) if crop_height is None else crop_height
+
+                # clamp to valid ranges
+                inferred_x = max(0, min(int(inferred_x), self.width))
+                inferred_y = max(0, min(int(inferred_y), self.height))
+                inferred_width = max(0, min(int(inferred_width), self.width - inferred_x))
+                inferred_height = max(0, min(int(inferred_height), self.height - inferred_y))
+                if inferred_width == 0 or inferred_height == 0:
+                    warnings.warn("resolved crop has zero width/height. Defaulting to lower 30% region of the frame.")
+                else:
+                    crop_x_start = inferred_x
+                    crop_y_start = inferred_y
+                    crop_x_end = inferred_x + inferred_width
+                    crop_y_end = inferred_y + inferred_height
+
+                    # warn if not all parameters were explicitly provided
+                    if None in [crop_x, crop_y, crop_width, crop_height]:
+                        warnings.warn(
+                            f"incomplete crop provided. Using inferred crop: x={crop_x_start}, y={crop_y_start}, "
+                            f"width={inferred_width}, height={inferred_height}.")
 
         # get frames from ocr_start to ocr_end
         with Capture(self.path) as v:
@@ -80,14 +114,22 @@ class Video:
             prev_grey = None
             predicted_frames = None
             modulo = frames_to_skip + 1
+            pbar = None
+            frames_to_process = (num_ocr_frames + modulo - 1) // modulo
+            try:
+                from tqdm import tqdm as _tqdm
+                pbar = _tqdm(total=frames_to_process, desc="Processing frames", unit="frame", dynamic_ncols=True, leave=False)
+            except Exception:
+                pass
+
             for i in range(num_ocr_frames):
                 if i % modulo == 0:
                     frame = v.read()[1]
                     if frame is None:
                         continue
                     if not self.use_fullframe:
-                        if crop_x_end and crop_y_end:
-                            frame = frame[crop_y:crop_y_end, crop_x:crop_x_end]
+                        if crop_x_end is not None and crop_y_end is not None:
+                            frame = frame[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
                         else:
                             # only use bottom third of the frame by default
                             frame = frame[2 * self.height // 3:, :]
@@ -102,14 +144,20 @@ class Video:
                             if np.count_nonzero(absdiff) < similar_image_threshold:
                                 predicted_frames.end_index = i + ocr_start
                                 prev_grey = grey
+                                if pbar is not None:
+                                    pbar.update(1)
                                 continue
 
                         prev_grey = grey
 
                     predicted_frames = PredictedFrames(i + ocr_start, ocr.ocr(frame), conf_threshold_percent)
                     self.pred_frames.append(predicted_frames)
+                    if pbar is not None:
+                        pbar.update(1)
                 else:
                     v.read()
+            if pbar is not None:
+                pbar.close()
         
 
     def get_subtitles(self, sim_threshold: int) -> str:
