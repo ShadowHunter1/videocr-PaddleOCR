@@ -171,7 +171,7 @@ class Video:
                         pbar.update(1)
                 else:
                     with profiler.measure('frame_read'):
-                        v.read()
+                        v.grab()
                     profiler.increment('frames_skipped_by_interval')
             if pbar is not None:
                 pbar.close()
