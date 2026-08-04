@@ -8,6 +8,7 @@ import warnings
 from . import utils
 from .models import PredictedFrames, PredictedSubtitle
 from .opencv_adapter import Capture
+from .profiler import profiler
 from paddleocr import PaddleOCR
 
 
@@ -29,11 +30,12 @@ class Video:
         self.path = path
         self.det_model_dir = det_model_dir
         self.rec_model_dir = rec_model_dir
-        with Capture(path) as v:
-            self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.fps = v.get(cv2.CAP_PROP_FPS)
-            self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
+        with profiler.measure('video_metadata_read'):
+            with Capture(path) as v:
+                self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.fps = v.get(cv2.CAP_PROP_FPS)
+                self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     def run_ocr(self, use_gpu: bool, lang: str, time_start: str, time_end: str,
                 conf_threshold: int, use_fullframe: bool, brightness_threshold: int, similar_image_threshold: int, similar_pixel_threshold: int, frames_to_skip: int,
@@ -45,24 +47,26 @@ class Video:
 
         # Fix for PaddleOCR versions greater or equal than 3.0.3
         if utils.needs_conversion():
-            ocr = PaddleOCR(
-                lang=self.lang,
-                text_recognition_model_dir=self.rec_model_dir,
-                text_detection_model_dir=self.det_model_dir,
-                text_detection_model_name=utils.get_model_name_from_dir(self.det_model_dir),
-                text_recognition_model_name=utils.get_model_name_from_dir(self.rec_model_dir),
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                device="gpu" if use_gpu else "cpu"
-            )
+            with profiler.measure('ocr_engine_init'):
+                ocr = PaddleOCR(
+                    lang=self.lang,
+                    text_recognition_model_dir=self.rec_model_dir,
+                    text_detection_model_dir=self.det_model_dir,
+                    text_detection_model_name=utils.get_model_name_from_dir(self.det_model_dir),
+                    text_recognition_model_name=utils.get_model_name_from_dir(self.rec_model_dir),
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    device="gpu" if use_gpu else "cpu"
+                )
         else:
-            ocr = PaddleOCR(
-                lang=self.lang,
-                rec_model_dir=self.rec_model_dir,
-                det_model_dir=self.det_model_dir,
-                use_gpu=use_gpu
-            )
+            with profiler.measure('ocr_engine_init'):
+                ocr = PaddleOCR(
+                    lang=self.lang,
+                    rec_model_dir=self.rec_model_dir,
+                    det_model_dir=self.det_model_dir,
+                    use_gpu=use_gpu
+                )
 
         ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
         ocr_end = utils.get_frame_index(time_end, self.fps) if time_end else self.num_frames
@@ -124,51 +128,67 @@ class Video:
 
             for i in range(num_ocr_frames):
                 if i % modulo == 0:
-                    frame = v.read()[1]
+                    with profiler.measure('frame_read'):
+                        frame = v.read()[1]
                     if frame is None:
                         continue
+                    profiler.increment('total_decoded_frames')
                     if not self.use_fullframe:
-                        if crop_x_end is not None and crop_y_end is not None:
-                            frame = frame[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
-                        else:
-                            # only use bottom third of the frame by default
-                            frame = frame[2 * self.height // 3:, :]
+                        with profiler.measure('frame_crop'):
+                            if crop_x_end is not None and crop_y_end is not None:
+                                frame = frame[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
+                            else:
+                                # only use bottom third of the frame by default
+                                frame = frame[2 * self.height // 3:, :]
 
                     if brightness_threshold:
-                        frame = cv2.bitwise_and(frame, frame, mask=cv2.inRange(frame, (brightness_threshold, brightness_threshold, brightness_threshold), (255, 255, 255)))
+                        with profiler.measure('brightness_filter'):
+                            frame = cv2.bitwise_and(frame, frame, mask=cv2.inRange(frame, (brightness_threshold, brightness_threshold, brightness_threshold), (255, 255, 255)))
 
                     if similar_image_threshold:
-                        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        if prev_grey is not None:
-                            _, absdiff = cv2.threshold(cv2.absdiff(prev_grey, grey), similar_pixel_threshold, 255, cv2.THRESH_BINARY)
-                            if np.count_nonzero(absdiff) < similar_image_threshold:
-                                predicted_frames.end_index = i + ocr_start
-                                prev_grey = grey
-                                if pbar is not None:
-                                    pbar.update(1)
-                                continue
+                        with profiler.measure('similarity_check'):
+                            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            if prev_grey is not None:
+                                _, absdiff = cv2.threshold(cv2.absdiff(prev_grey, grey), similar_pixel_threshold, 255, cv2.THRESH_BINARY)
+                                if np.count_nonzero(absdiff) < similar_image_threshold:
+                                    predicted_frames.end_index = i + ocr_start
+                                    prev_grey = grey
+                                    profiler.increment('frames_skipped_by_ssim')
+                                    if pbar is not None:
+                                        pbar.update(1)
+                                    continue
 
-                        prev_grey = grey
+                            prev_grey = grey
 
-                    predicted_frames = PredictedFrames(i + ocr_start, ocr.ocr(frame), conf_threshold_percent)
+                    with profiler.measure('ocr_inference'):
+                        ocr_result = ocr.ocr(frame)
+                    profiler.increment('ocr_calls')
+
+                    with profiler.measure('predicted_frames_build'):
+                        predicted_frames = PredictedFrames(i + ocr_start, ocr_result, conf_threshold_percent)
                     self.pred_frames.append(predicted_frames)
                     if pbar is not None:
                         pbar.update(1)
                 else:
-                    v.read()
+                    with profiler.measure('frame_read'):
+                        v.read()
+                    profiler.increment('frames_skipped_by_interval')
             if pbar is not None:
                 pbar.close()
         
 
     def get_subtitles(self, sim_threshold: int) -> str:
-        self._generate_subtitles(sim_threshold)
-        return ''.join(
-            '{}\n{} --> {}\n{}\n\n'.format(
-                i,
-                utils.get_srt_timestamp(sub.index_start, self.fps),
-                utils.get_srt_timestamp(sub.index_end + 1, self.fps),
-                sub.text)
-            for i, sub in enumerate(self.pred_subs, start=1))
+        with profiler.measure('subtitle_generation'):
+            self._generate_subtitles(sim_threshold)
+        with profiler.measure('srt_formatting'):
+            result = ''.join(
+                '{}\n{} --> {}\n{}\n\n'.format(
+                    i,
+                    utils.get_srt_timestamp(sub.index_start, self.fps),
+                    utils.get_srt_timestamp(sub.index_end + 1, self.fps),
+                    sub.text)
+                for i, sub in enumerate(self.pred_subs, start=1))
+        return result
 
     def _generate_subtitles(self, sim_threshold: int) -> None:
         self.pred_subs = []
@@ -181,6 +201,7 @@ class Video:
         for frame in self.pred_frames:
             self._append_sub(PredictedSubtitle([frame], sim_threshold), max_frame_merge_diff)
         self.pred_subs = [sub for sub in self.pred_subs if len(sub.frames[0].lines) > 0]
+        profiler.increment('subtitles_generated', len(self.pred_subs))
 
     def _append_sub(self, sub: PredictedSubtitle, max_frame_merge_diff: int) -> None:
         if len(sub.frames) == 0:
