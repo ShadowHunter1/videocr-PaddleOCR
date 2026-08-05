@@ -155,7 +155,7 @@ class Video:
                     if pbar is not None:
                         pbar.update(1)
                 else:
-                    v.read()
+                    v.grab()
             if pbar is not None:
                 pbar.close()
         
